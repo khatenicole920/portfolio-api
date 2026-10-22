@@ -69,7 +69,25 @@ module.exports = async (req, res) => {
 
     // ---------- PUT /api/attendance  (EDIT existing) ----------
     if (req.method === "PUT") {
-      const { student_id, status, date } = req.body || {};
+      const { student_id, status, date, student_name, subject_name, course } = req.body || {};
+
+      // Edit student details (name / subject / course)
+      if (student_name !== undefined || subject_name !== undefined || course !== undefined) {
+        const name = String(student_name || "").trim().slice(0, 100);
+        if (!student_id || !name)
+          return res.status(400).json({ error: "student_id and student_name are required." });
+        const result = await collection.updateOne(
+          { student_id },
+          { $set: {
+              student_name: name,
+              subject_name: String(subject_name || "").trim().slice(0, 100),
+              course: String(course || "").trim().slice(0, 50)
+          } }
+        );
+        if (!result.matchedCount) return res.status(404).json({ error: "Student not found." });
+        return res.json({ ok: true, student_id });
+      }
+
       const target = date || today();
       if (!student_id || !STATUSES.includes(status))
         return res.status(400).json({ error: "student_id and status (Present/Absent/Late) are required." });
