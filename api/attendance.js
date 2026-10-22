@@ -1,20 +1,28 @@
 // Vercel Serverless Function — /api/attendance
-// Uses Mongoose (already in your package.json) to talk to
-// LabAttendanceDB_MARQUEZ.daily_attendance
+// DB: LabAttendanceDB_MARQUEZ.daily_attendance
 // Student doc: { student_id, student_name, subject_name, course,
 //                attendance_records: [{date, status, time}] }
+//
+// Optional protection: set an ADMIN_KEY environment variable in Vercel.
+// When set, POST / PUT / DELETE must send the header  X-Admin-Key: <ADMIN_KEY>.
+// GET (viewing) stays public. If ADMIN_KEY is not set, behaviour is unchanged.
 
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 
 const DB = "LabAttendanceDB_MARQUEZ";
 const COL = "daily_attendance";
 const STATUSES = ["Present", "Absent", "Late"];
 
-let conn = null;
+// Cache the connection *promise* so parallel requests share one connection attempt.
+let connPromise = null;
 async function getCol() {
-  if (!conn) {
-    conn = await mongoose.connect(process.env.MONGODB_URI, { dbName: DB });
+  if (!connPromise) {
+    connPromise = mongoose
+      .connect(process.env.MONGODB_URI, { dbName: DB })
+      .catch(err => { connPromise = null; throw err; }); // allow a retry on the next request
   }
+  await connPromise;
   return mongoose.connection.db.collection(COL);
 }
 
@@ -22,18 +30,77 @@ async function getCol() {
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Manila" }); // YYYY-MM-DD
 const nowTime = () => new Date().toLocaleTimeString("en-US", { timeZone: "Asia/Manila", hour: "2-digit", minute: "2-digit" });
 
+// Accept only real calendar dates in YYYY-MM-DD format
+function isValidDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + "T00:00:00Z");
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+// Accept only YYYY-MM (month 01-12)
+const isValidMonth = s => /^\d{4}-(0[1-9]|1[0-2])$/.test(s);
+
+// Constant-time comparison for the admin key
+function keyMatches(provided) {
+  const expected = Buffer.from(process.env.ADMIN_KEY);
+  const given = Buffer.from(String(provided || ""));
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key");
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const collection = await getCol();
-
   try {
+    // Block changes unless the admin key matches (only when ADMIN_KEY is configured)
+    if (req.method !== "GET" && process.env.ADMIN_KEY && !keyMatches(req.headers["x-admin-key"])) {
+      return res.status(401).json({ error: "Admin key required." });
+    }
+
+    const collection = await getCol(); // inside try/catch so DB failures return a clean 500
+
+    // ---------- GET /api/attendance?month=YYYY-MM  (monthly summary) ----------
+    if (req.method === "GET" && req.query.month) {
+      const month = req.query.month;
+      if (!isValidMonth(month)) return res.status(400).json({ error: "month must be YYYY-MM." });
+
+    const students = await collection.find({}).sort({ _id: 1 }).toArray();
+      const perDay = {};
+
+      const list = students.map(s => {
+        const c = { Present: 0, Absent: 0, Late: 0 };
+        (s.attendance_records || []).forEach(r => {
+          if (typeof r.date !== "string" || !r.date.startsWith(month + "-") || !STATUSES.includes(r.status)) return;
+          c[r.status]++;
+          if (!perDay[r.date]) perDay[r.date] = { date: r.date, Present: 0, Absent: 0, Late: 0 };
+          perDay[r.date][r.status]++;
+        });
+        const marked = c.Present + c.Absent + c.Late;
+        return {
+          student_id: s.student_id,
+          student_name: s.student_name,
+          subject_name: s.subject_name,
+          course: s.course,
+          present: c.Present, late: c.Late, absent: c.Absent, marked,
+          // Attendance rate = (Present + Late) / days marked, one decimal place
+          rate: marked ? Math.round(((c.Present + c.Late) / marked) * 1000) / 10 : null,
+        };
+      });
+
+      return res.json({
+        month,
+        days: Object.values(perDay).sort((a, b) => a.date.localeCompare(b.date)),
+        students: list,
+      });
+    }
+
     // ---------- GET /api/attendance?date=YYYY-MM-DD ----------
     if (req.method === "GET") {
       const date = req.query.date || today();
+      if (!isValidDate(date)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
+
       const students = await collection.find({}).sort({ student_id: 1 }).toArray();
       return res.json(students.map(s => {
         const rec = (s.attendance_records || []).find(r => r.date === date);
@@ -52,18 +119,34 @@ module.exports = async (req, res) => {
     if (req.method === "POST") {
       const { student_id, status, date } = req.body || {};
       const target = date || today();
+
+      // BULK: mark every student who has no record yet for this date
+      if (req.body && req.body.bulk === true) {
+        if (!STATUSES.includes(status))
+          return res.status(400).json({ error: "status (Present/Absent/Late) is required." });
+        if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
+        const bulk = await collection.updateMany(
+          { "attendance_records.date": { $ne: target } },
+          { $push: { attendance_records: { date: target, status, time: nowTime() } } }
+        );
+        return res.json({ ok: true, date: target, status, marked: bulk.modifiedCount });
+      }
+
       if (!student_id || !STATUSES.includes(status))
         return res.status(400).json({ error: "student_id and status (Present/Absent/Late) are required." });
+      if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
 
-      const student = await collection.findOne({ student_id });
-      if (!student) return res.status(404).json({ error: "Student not found." });
-      if ((student.attendance_records || []).some(r => r.date === target))
-        return res.status(409).json({ error: "Already marked for this date. Use Edit instead." });
-
-      await collection.updateOne(
-        { student_id },
+      // Atomic: only push if no record for this date exists yet (no check-then-write race)
+      const result = await collection.updateOne(
+        { student_id, "attendance_records.date": { $ne: target } },
         { $push: { attendance_records: { date: target, status, time: nowTime() } } }
       );
+
+      if (!result.matchedCount) {
+        const exists = await collection.findOne({ student_id }, { projection: { _id: 1 } });
+        if (!exists) return res.status(404).json({ error: "Student not found." });
+        return res.status(409).json({ error: "Already marked for this date. Use Edit instead." });
+      }
       return res.json({ ok: true, student_id, date: target, status });
     }
 
@@ -91,6 +174,7 @@ module.exports = async (req, res) => {
       const target = date || today();
       if (!student_id || !STATUSES.includes(status))
         return res.status(400).json({ error: "student_id and status (Present/Absent/Late) are required." });
+      if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
 
       const result = await collection.updateOne(
         { student_id, "attendance_records.date": target },
@@ -105,6 +189,7 @@ module.exports = async (req, res) => {
       const { student_id, date } = req.query;
       const target = date || today();
       if (!student_id) return res.status(400).json({ error: "student_id is required." });
+      if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
 
       const result = await collection.updateOne(
         { student_id },
