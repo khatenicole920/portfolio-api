@@ -120,35 +120,53 @@ module.exports = async (req, res) => {
       const { student_id, status, date } = req.body || {};
       const target = date || today();
 
+      // CREATE: add a brand-new student ...
+      if (req.body && req.body.create === true) {
+         ...
+      }
+
       // BULK: mark every student who has no record yet for this date
       if (req.body && req.body.bulk === true) {
-        if (!STATUSES.includes(status))
-          return res.status(400).json({ error: "status (Present/Absent/Late) is required." });
-        if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
-        const bulk = await collection.updateMany(
-          { "attendance_records.date": { $ne: target } },
-          { $push: { attendance_records: { date: target, status, time: nowTime() } } }
-        );
-        return res.json({ ok: true, date: target, status, marked: bulk.modifiedCount });
+         ...
       }
 
       if (!student_id || !STATUSES.includes(status))
-        return res.status(400).json({ error: "student_id and status (Present/Absent/Late) are required." });
-      if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
+        return res.status(400).json({ error: "student_id and status ..." });
 
-      // Atomic: only push if no record for this date exists yet (no check-then-write race)
-      const result = await collection.updateOne(
-        { student_id, "attendance_records.date": { $ne: target } },
-        { $push: { attendance_records: { date: target, status, time: nowTime() } } }
-      );
+      // BULK: mark every student who has no record yet for this date
+      // CREATE: add a brand-new student with the next student_id (STU016, STU017, ...)
+      if (req.body && req.body.create === true) {
+        const name = String(req.body.student_name || "").trim().slice(0, 100);
+        const subject = String(req.body.subject_name || "").trim().slice(0, 100);
+        const courseName = String(req.body.course || "").trim().slice(0, 50);
+        if (!name || !subject || !courseName)
+          return res.status(400).json({ error: "Student name, subject and course are required." });
+        if (status && !STATUSES.includes(status))
+          return res.status(400).json({ error: "status must be Present, Absent or Late." });
+        if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
 
-      if (!result.matchedCount) {
-        const exists = await collection.findOne({ student_id }, { projection: { _id: 1 } });
-        if (!exists) return res.status(404).json({ error: "Student not found." });
-        return res.status(409).json({ error: "Already marked for this date. Use Edit instead." });
+        // A unique index makes two simultaneous creates unable to share one ID
+        try { await collection.createIndex({ student_id: 1 }, { unique: true }); } catch (e) { /* already exists */ }
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const all = await collection.find({}, { projection: { student_id: 1 } }).toArray();
+          const highest = all.reduce((m, s) => Math.max(m, parseInt(String(s.student_id).replace(/\D/g, ""), 10) || 0), 0);
+          const newId = "STU" + String(highest + 1).padStart(3, "0");
+          try {
+            await collection.insertOne({
+              student_id: newId,
+              student_name: name,
+              subject_name: subject,
+              course: courseName,
+              attendance_records: status ? [{ date: target, status, time: nowTime() }] : []
+            });
+            return res.status(201).json({ ok: true, student_id: newId });
+          } catch (err) {
+            if (err.code !== 11000) throw err;   // retry only when the ID was just taken
+          }
+        }
+        return res.status(409).json({ error: "Could not assign a new student ID. Please try again." });
       }
-      return res.json({ ok: true, student_id, date: target, status });
-    }
 
     // ---------- PUT /api/attendance  (EDIT existing) ----------
     if (req.method === "PUT") {
