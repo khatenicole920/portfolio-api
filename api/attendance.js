@@ -66,7 +66,7 @@ module.exports = async (req, res) => {
       const month = req.query.month;
       if (!isValidMonth(month)) return res.status(400).json({ error: "month must be YYYY-MM." });
 
-    const students = await collection.find({}).sort({ _id: 1 }).toArray();
+      const students = await collection.find({}).sort({ _id: 1 }).toArray();
       const perDay = {};
 
       const list = students.map(s => {
@@ -115,25 +115,11 @@ module.exports = async (req, res) => {
       }));
     }
 
-    // ---------- POST /api/attendance  (mark NEW) ----------
+    // ---------- POST /api/attendance ----------
     if (req.method === "POST") {
       const { student_id, status, date } = req.body || {};
       const target = date || today();
 
-      // CREATE: add a brand-new student ...
-      if (req.body && req.body.create === true) {
-         ...
-      }
-
-      // BULK: mark every student who has no record yet for this date
-      if (req.body && req.body.bulk === true) {
-         ...
-      }
-
-      if (!student_id || !STATUSES.includes(status))
-        return res.status(400).json({ error: "student_id and status ..." });
-
-      // BULK: mark every student who has no record yet for this date
       // CREATE: add a brand-new student with the next student_id (STU016, STU017, ...)
       if (req.body && req.body.create === true) {
         const name = String(req.body.student_name || "").trim().slice(0, 100);
@@ -167,6 +153,37 @@ module.exports = async (req, res) => {
         }
         return res.status(409).json({ error: "Could not assign a new student ID. Please try again." });
       }
+
+      // BULK: mark every student who has no record yet for this date
+      if (req.body && req.body.bulk === true) {
+        if (!STATUSES.includes(status))
+          return res.status(400).json({ error: "status (Present/Absent/Late) is required." });
+        if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
+        const bulk = await collection.updateMany(
+          { "attendance_records.date": { $ne: target } },
+          { $push: { attendance_records: { date: target, status, time: nowTime() } } }
+        );
+        return res.json({ ok: true, date: target, status, marked: bulk.modifiedCount });
+      }
+
+      // MARK one student
+      if (!student_id || !STATUSES.includes(status))
+        return res.status(400).json({ error: "student_id and status (Present/Absent/Late) are required." });
+      if (!isValidDate(target)) return res.status(400).json({ error: "date must be YYYY-MM-DD." });
+
+      // Atomic: only push if no record for this date exists yet (no check-then-write race)
+      const result = await collection.updateOne(
+        { student_id, "attendance_records.date": { $ne: target } },
+        { $push: { attendance_records: { date: target, status, time: nowTime() } } }
+      );
+
+      if (!result.matchedCount) {
+        const exists = await collection.findOne({ student_id }, { projection: { _id: 1 } });
+        if (!exists) return res.status(404).json({ error: "Student not found." });
+        return res.status(409).json({ error: "Already marked for this date. Use Edit instead." });
+      }
+      return res.json({ ok: true, student_id, date: target, status });
+    }
 
     // ---------- PUT /api/attendance  (EDIT existing) ----------
     if (req.method === "PUT") {
